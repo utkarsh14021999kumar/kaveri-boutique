@@ -1,0 +1,69 @@
+name: wif-smoke
+
+# Step 2.12 (kaveri-platform #72): keyless push from main + least-privilege checks of the image pusher.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+
+env:
+  PROJECT: ${{ vars.GCP_PROJECT_ID }}
+  REGISTRY: ${{ vars.GAR_LOCATION }}-docker.pkg.dev/${{ vars.GCP_PROJECT_ID }}/${{ vars.GAR_REPOSITORY }}
+
+jobs:
+  smoke:
+    name: WIF smoke (image pusher)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Authenticate via WIF as the image pusher (main only)
+        uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3
+        with:
+          workload_identity_provider: ${{ vars.GCP_WIF_PROVIDER }}
+          service_account: ${{ vars.GCP_IMAGE_PUSHER_SA }}
+
+      - uses: google-github-actions/setup-gcloud@aa5489c8933f4cc7a4f7d45035b3b1440c9c10db # v3.0.1
+
+      - name: T1 - build, push, read back by digest
+        run: |
+          set -euo pipefail
+          gcloud auth configure-docker "${{ vars.GAR_LOCATION }}-docker.pkg.dev" --quiet
+          mkdir -p smoke
+          echo "kaveri wif smoke ${GITHUB_SHA}" > smoke/marker
+          printf 'FROM scratch\nCOPY marker /marker\n' > smoke/Dockerfile
+          IMG="${REGISTRY}/smoke/wif-smoke:${GITHUB_SHA::7}"
+          docker build -q -t "$IMG" smoke
+          docker push "$IMG" | tee push.log
+          DIGEST=$(grep -oE 'sha256:[0-9a-f]{64}' push.log | tail -1)
+          test -n "$DIGEST"
+          READ=$(gcloud artifacts docker images describe "${REGISTRY}/smoke/wif-smoke@${DIGEST}" \
+            --format='value(image_summary.digest)')
+          test "$READ" = "$DIGEST"
+          echo "PASS-T1 pushed and read back ${REGISTRY}/smoke/wif-smoke@${DIGEST}"
+          echo "### T1 pushed by digest: smoke/wif-smoke@${DIGEST}" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: T2 - pusher must NOT list GCS buckets
+        run: |
+          if gcloud storage buckets list --project "$PROJECT" > out.txt 2>&1; then
+            echo "FAIL-T2: pusher can list buckets"; exit 1
+          fi
+          cat out.txt
+          if grep -qE '403|PERMISSION_DENIED|does not have|denied' out.txt; then
+            echo "PASS-T2 bucket list denied (permission)"
+          else
+            echo "FAIL-T2: failed for a non-permission reason"; exit 1
+          fi
+
+      - name: T3 - pusher must NOT delete images
+        run: |
+          if gcloud artifacts docker images delete "${REGISTRY}/smoke/wif-smoke:${GITHUB_SHA::7}" \
+               --delete-tags --quiet > out.txt 2>&1; then
+            echo "FAIL-T3: pusher can delete images"; exit 1
+          fi
+          cat out.txt
+          if grep -qE 'PERMISSION_DENIED|[Pp]ermission.*denied|does not have' out.txt; then
+            echo "PASS-T3 image delete denied (permission)"
+          else
+            echo "FAIL-T3: failed for a non-permission reason"; exit 1
+          fi
