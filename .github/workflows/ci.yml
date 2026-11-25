@@ -1,0 +1,255 @@
+name: ci
+
+# KAVERI step 2.13 (ADR-0015): unit tests, Gitleaks, SonarCloud, docker build,
+# Trivy scans, SBOM, and push by digest from main via the WIF image pusher.
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  REGISTRY: ${{ vars.GAR_LOCATION }}-docker.pkg.dev/${{ vars.GCP_PROJECT_ID }}/${{ vars.GAR_REPOSITORY }}
+  TRIVY_IMAGE: aquasec/trivy@sha256:8f6bb947dbc528902e11f2f5be52f7b519f6a39d5d148f41166f2040499768fb
+  GITLEAKS_IMAGE: zricethezav/gitleaks@sha256:c00b6bd0aeb3071cbcb79009cb16a60dd9e0a7c60e2be9ab65d25e6bc8abbb7f
+  IS_MAIN: ${{ github.event_name != 'pull_request' && github.ref == 'refs/heads/main' }}
+
+jobs:
+  discover:
+    name: discover
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.find.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Find service Dockerfiles
+        id: find
+        run: |
+          set -euo pipefail
+          m=$(find src -mindepth 2 -maxdepth 3 -name Dockerfile | sort | while read -r f; do
+                printf '{"service":"%s","context":"%s","dockerfile":"%s"}\n' \
+                  "$(echo "$f" | cut -d/ -f2)" "$(dirname "$f")" "$f"
+              done | jq -cs .)
+          echo "$m" | jq .
+          echo "$m" | jq -e 'length > 0 and (map(.service) | length == (unique | length))' > /dev/null
+          echo "matrix=$m" >> "$GITHUB_OUTPUT"
+
+  secrets:
+    name: secrets-scan (gitleaks)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Gitleaks on the commits in this change
+        env:
+          BASE_PR: ${{ github.event.pull_request.base.sha }}
+          BEFORE: ${{ github.event.before }}
+        run: |
+          set -euo pipefail
+          BASE="${BASE_PR:-${BEFORE:-}}"
+          if [ -z "$BASE" ] || [ "$BASE" = "0000000000000000000000000000000000000000" ] \
+             || ! git cat-file -e "${BASE}^{commit}" 2> /dev/null; then
+            RANGE="HEAD~1..HEAD"
+          else
+            RANGE="${BASE}..HEAD"
+          fi
+          echo "Scanning commit range: $RANGE"
+          docker run --rm -v "$PWD:/repo" -w /repo \
+            -e GIT_CONFIG_COUNT=1 -e GIT_CONFIG_KEY_0=safe.directory -e GIT_CONFIG_VALUE_0='*' \
+            "$GITLEAKS_IMAGE" git --redact --verbose --exit-code 1 --log-opts="$RANGE" .
+
+  sonarcloud:
+    name: sonarcloud
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: SonarCloud scan and quality gate
+        uses: SonarSource/sonarqube-scan-action@e805d875275f728fac1885b413934be6d7c63f65 # v8.4.1
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          SONAR_HOST_URL: https://sonarcloud.io
+        with:
+          args: >
+            -Dsonar.organization=${{ vars.SONAR_ORGANIZATION }}
+            -Dsonar.projectKey=${{ vars.SONAR_PROJECT_KEY }}
+            -Dsonar.sources=src
+            -Dsonar.exclusions=src/adservice/**,src/cartservice/**,**/genproto/**,**/*_pb2.py,**/*_pb2_grpc.py,**/node_modules/**,**/*_test.go,**/test_*.py,**/*.test.js
+            -Dsonar.tests=src
+            -Dsonar.test.inclusions=**/*_test.go,**/test_*.py,**/*.test.js
+            -Dsonar.test.exclusions=src/adservice/**,src/cartservice/**
+            -Dsonar.qualitygate.wait=true
+            -Dsonar.qualitygate.timeout=300
+
+  service:
+    name: build (${{ matrix.service }})
+    needs: discover
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.discover.outputs.matrix) }}
+    env:
+      SVC: ${{ matrix.service }}
+      CTX: ${{ matrix.context }}
+      DOCKERFILE: ${{ matrix.dockerfile }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Detect unit-test toolchain
+        id: lang
+        run: |
+          set -euo pipefail
+          d="src/$SVC"
+          p=$(find "$d" -maxdepth 2 -path '*/tests/*.csproj' 2> /dev/null | head -1)
+          if [ -f "$d/go.mod" ]; then
+            echo "kind=go" >> "$GITHUB_OUTPUT"
+          elif [ -n "$p" ]; then
+            v=$(grep -oE 'net[0-9]+\.[0-9]+' "$p" | head -1 | sed 's/^net//')
+            { echo "kind=dotnet"; echo "proj=$p"; echo "dotnet=${v}.x"; } >> "$GITHUB_OUTPUT"
+          else
+            echo "kind=none" >> "$GITHUB_OUTPUT"
+          fi
+      - if: steps.lang.outputs.kind == 'go'
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: src/${{ matrix.service }}/go.mod
+          cache-dependency-path: src/${{ matrix.service }}/go.sum
+      - name: Go unit tests
+        if: steps.lang.outputs.kind == 'go'
+        working-directory: src/${{ matrix.service }}
+        run: go test ./...
+      - if: steps.lang.outputs.kind == 'dotnet'
+        uses: actions/setup-dotnet@0f4a354dd5547a28c70b7853dbd95d5b67886e73 # v6.1.0
+        with:
+          dotnet-version: ${{ steps.lang.outputs.dotnet }}
+      - name: .NET unit tests
+        if: steps.lang.outputs.kind == 'dotnet'
+        env:
+          PROJ: ${{ steps.lang.outputs.proj }}
+        run: dotnet test "$PROJ"
+      - name: Record services without unit tests
+        if: steps.lang.outputs.kind == 'none'
+        run: |
+          echo "::notice title=no unit tests::$SVC has no unit tests detected"
+          echo "- $SVC: no unit tests detected" >> "$GITHUB_STEP_SUMMARY"
+      - name: Docker build
+        id: build
+        run: docker build --provenance=false -t "local/$SVC:$GITHUB_SHA" -f "$DOCKERFILE" "$CTX"
+      - name: Trivy filesystem scan (CRITICAL, fix available)
+        run: |
+          mkdir -p "$HOME/.cache/trivy"
+          docker run --rm -v "$HOME/.cache/trivy:/root/.cache/trivy" -v "$PWD:/work" -w /work "$TRIVY_IMAGE" \
+            fs --scanners vuln --severity CRITICAL --ignore-unfixed --ignorefile .trivyignore \
+            --exit-code 1 --no-progress "$CTX"
+      - name: Trivy image scan (CRITICAL, fix available)
+        run: |
+          docker run --rm -v /var/run/docker.sock:/var/run/docker.sock \
+            -v "$HOME/.cache/trivy:/root/.cache/trivy" -v "$PWD:/work" -w /work "$TRIVY_IMAGE" \
+            image --severity CRITICAL --ignore-unfixed --ignorefile .trivyignore \
+            --exit-code 1 --no-progress "local/$SVC:$GITHUB_SHA"
+      - name: Trivy HIGH report (informational)
+        if: always() && steps.build.outcome == 'success'
+        run: |
+          docker run --rm -v /var/run/docker.sock:/var/run/docker.sock \
+            -v "$HOME/.cache/trivy:/root/.cache/trivy" "$TRIVY_IMAGE" \
+            image --severity HIGH --ignore-unfixed --exit-code 0 --no-progress "local/$SVC:$GITHUB_SHA"
+      - name: SBOM (CycloneDX)
+        if: always() && steps.build.outcome == 'success'
+        run: |
+          docker run --rm -v /var/run/docker.sock:/var/run/docker.sock \
+            -v "$HOME/.cache/trivy:/root/.cache/trivy" -v "$PWD:/work" -w /work "$TRIVY_IMAGE" \
+            image --format cyclonedx --output "/work/sbom-$SVC.cdx.json" "local/$SVC:$GITHUB_SHA"
+      - name: Upload SBOM
+        if: always() && steps.build.outcome == 'success'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: sbom-${{ matrix.service }}
+          path: sbom-${{ matrix.service }}.cdx.json
+          retention-days: 30
+      - name: Authenticate via WIF as the image pusher (main only, after build and scan)
+        if: env.IS_MAIN == 'true'
+        uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3
+        with:
+          workload_identity_provider: ${{ vars.GCP_WIF_PROVIDER }}
+          service_account: ${{ vars.GCP_IMAGE_PUSHER_SA }}
+      - if: env.IS_MAIN == 'true'
+        uses: google-github-actions/setup-gcloud@aa5489c8933f4cc7a4f7d45035b3b1440c9c10db # v3.0.1
+      - name: Push by digest
+        if: env.IS_MAIN == 'true'
+        run: |
+          set -euo pipefail
+          gcloud auth configure-docker "${{ vars.GAR_LOCATION }}-docker.pkg.dev" --quiet
+          IMG="$REGISTRY/$SVC"
+          TAG="${GITHUB_SHA::12}-r${GITHUB_RUN_ID}"
+          docker tag "local/$SVC:$GITHUB_SHA" "$IMG:$TAG"
+          docker push "$IMG:$TAG" | tee push.log
+          DIGEST=$(grep -oE 'digest: sha256:[0-9a-f]{64}' push.log | tail -1 | cut -d' ' -f2)
+          test -n "$DIGEST"
+          READ=$(gcloud artifacts docker images describe "$IMG@$DIGEST" --format='value(image_summary.digest)')
+          test "$READ" = "$DIGEST"
+          export IMG TAG DIGEST
+          mkdir -p digests
+          jq -n '{service: env.SVC, image: env.IMG, digest: env.DIGEST, tag: env.TAG}' > "digests/$SVC.json"
+          echo "PUSHED $SVC $IMG@$DIGEST"
+          echo "| $SVC | \`$IMG@$DIGEST\` |" >> "$GITHUB_STEP_SUMMARY"
+      - name: Upload digest record
+        if: env.IS_MAIN == 'true'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: digest-${{ matrix.service }}
+          path: digests/${{ matrix.service }}.json
+          retention-days: 30
+
+  release-digests:
+    name: release-digests
+    needs: service
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: digest-*
+          merge-multiple: true
+          path: digests
+      - name: Combine into release-digests.json
+        run: |
+          set -euo pipefail
+          jq -s 'sort_by(.service)' digests/*.json > release-digests.json
+          jq . release-digests.json
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: release-digests
+          path: release-digests.json
+          retention-days: 90
+
+  ci-gate:
+    name: ci-gate
+    if: always()
+    needs: [discover, secrets, sonarcloud, service]
+    runs-on: ubuntu-latest
+    steps:
+      - name: All required jobs passed
+        env:
+          RESULTS: ${{ toJSON(needs) }}
+        run: |
+          echo "$RESULTS" | jq -r 'to_entries[] | "\(.key)=\(.value.result)"'
+          echo "$RESULTS" | jq -e 'all(.[]; .result == "success")' > /dev/null
