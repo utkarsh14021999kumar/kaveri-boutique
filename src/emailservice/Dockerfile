@@ -51,4 +51,6 @@ COPY --from=builder /usr/local/lib/python3.14/ /usr/local/lib/python3.14/
 COPY . .
 
 EXPOSE 8080
+# KAVERI (ADR-0015): runtime image needs no pip/setuptools (pip vendors its own certifi etc.)
+RUN python -m pip uninstall -y pip setuptools wheel && rm -rf /usr/local/lib/python3*/ensurepip
 ENTRYPOINT [ "python", "email_server.py" ]
