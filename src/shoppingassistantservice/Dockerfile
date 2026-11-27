@@ -44,4 +44,8 @@ COPY . .
 ENV PORT="8080"
 EXPOSE 8080
 
+# KAVERI (ADR-0015): take fixed OS packages from the base image repository
+RUN apt-get update && apt-get upgrade -y && rm -rf /var/lib/apt/lists/*
+# KAVERI (ADR-0015): runtime image needs no pip/setuptools (pip vendors its own certifi etc.)
+RUN python -m pip uninstall -y pip setuptools wheel && rm -rf /usr/local/lib/python3*/ensurepip
 ENTRYPOINT ["python", "shoppingassistantservice.py"]

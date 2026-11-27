@@ -49,4 +49,6 @@ COPY locustfile.py .
 # enable gevent support in debugger
 ENV GEVENT_SUPPORT=True
 
+# KAVERI (ADR-0015): runtime image needs no pip/setuptools (pip vendors its own certifi etc.)
+RUN python -m pip uninstall -y pip setuptools wheel && rm -rf /usr/local/lib/python3*/ensurepip
 ENTRYPOINT locust --host="http://${FRONTEND_ADDR}" --headless -u "${USERS:-10}" -r "${RATE:-1}" 2>&1

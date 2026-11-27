@@ -1,0 +1,2 @@
+# KAVERI Trivy exceptions (ADR-0015). One CVE per line with a comment:
+# CVE-YYYY-NNNNN  # justification, expiry YYYY-MM-DD, ticket #N
